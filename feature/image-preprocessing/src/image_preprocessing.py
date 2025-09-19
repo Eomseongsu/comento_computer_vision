@@ -2,8 +2,8 @@ import os
 import cv2
 import numpy as np
 
-image = cv2.imread("sample.jpg")
-OUTPUT_DIR = "./preprocessed_samples"
+image = cv2.imread("../data/ample.jpg")
+OUTPUT_DIR = "../data/preprocessed_samples"
 
 # ===== 1.크기조정(224×224) =====
 resized = cv2.resize(image, (224, 224))
