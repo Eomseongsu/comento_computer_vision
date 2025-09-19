@@ -2,11 +2,11 @@ import os
 import cv2
 import numpy as np
 
-image = cv2.imread("sample.jpg")
-OUTPUT_DIR = "./preprocessed_samples"
+image = cv2.imread("../data/ample.jpg")
+OUTPUT_DIR = "../data/preprocessed_samples"
 
 # ===== 1.크기조정(224×224) =====
-resized = cv2.resize(image, (224, 224), interpolation=cv2.INTER_AREA)
+resized = cv2.resize(image, (224, 224))
 cv2.imwrite(os.path.join(OUTPUT_DIR, "sample1.jpg"), resized)
 
 # ===== 2.색상변환(Grayscale & Normalize 적용) =====
@@ -15,7 +15,7 @@ gray_norm = gray.astype(np.float32) / 255.0
 cv2.imwrite(os.path.join(OUTPUT_DIR, "sample2.jpg"), gray_norm)
 
 # ===== 3.노이즈제거(Blur 필터적용) =====
-blur = cv2.GaussianBlur(image, (9, 9), 5)
+blur = cv2.GaussianBlur(resized, (9, 9), 5)
 cv2.imwrite(os.path.join(OUTPUT_DIR, "sample3.jpg"), blur)
 
 # ===== 4.데이터증강(좌우반전, 회전, 색상변화) =====
