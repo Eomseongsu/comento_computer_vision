@@ -1,227 +1,251 @@
 # classification-of-face/src/detecting_arcface.py
 from pathlib import Path
-import glob
-import cv2
-import numpy as np
-from numpy.linalg import norm
-import torch
+import glob, argparse, json, time
+import cv2, numpy as np, torch
 from ultralytics import YOLO
 from insightface.app import FaceAnalysis
 
-# ===================== 설정 =====================
-ROOT       = Path(__file__).resolve().parent
-WEIGHTS    = (ROOT / "../weights/best.pt").resolve()
-REF_DIR    = (ROOT / "../data/ref").resolve()     # 특정 인물 참조 이미지 폴더
-TEST_DIR   = (ROOT / "../data/test").resolve()    # 추론 대상 이미지 폴더
-SAVE_ROOT  = (ROOT / "../runs_pred").resolve()    # 결과 저장 폴더
+# -------------------- 기본 경로 --------------------
+ROOT      = Path(__file__).resolve().parent
+WEIGHTS   = (ROOT / "../weights/best.pt").resolve()
+REF_DIR   = (ROOT / "../data/ref").resolve()
+TEST_DIR  = (ROOT / "../data/test").resolve()
+SAVE_ROOT = (ROOT / "../runs_pred").resolve()
+CACHE_DIR = (ROOT / "../.cache").resolve()
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# YOLO
-CONF_YOLO   = 0.25
-IOU_YOLO    = 0.60
-IMGSZ_YOLO  = 768
-DEVICE_YOLO = "cpu"   # GPU면 "0"
+# -------------------- 유틸 --------------------
+def iou_xyxy(a, b):
+    ax1, ay1, ax2, ay2 = a; bx1, by1, bx2, by2 = b
+    inter_x1, inter_y1 = max(ax1, bx1), max(ay1, by1)
+    inter_x2, inter_y2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, inter_x2 - inter_x1), max(0, inter_y2 - inter_y1)
+    inter = iw * ih
+    if inter == 0: return 0.0
+    area_a = (ax2 - ax1) * (ay2 - ay1); area_b = (bx2 - bx1) * (by2 - by1)
+    return inter / (area_a + area_b - inter + 1e-6)
 
-# ArcFace/매칭
-SIM_THRESH  = 0.33    # (0~1) 미검 많으면 ↓(0.32), 오탐 많으면 ↑(0.35~0.40)
-ARC_CTX_ID  = -1      # CPU=-1, GPU 0번=0 (onnxruntime-gpu 필요)
-# =================================================
+def list_images(p: Path):
+    paths = []
+    for ext in ("*.jpg","*.jpeg","*.png","*.bmp","*.webp","*.tif","*.tiff"):
+        paths += glob.glob(str(p / ext))
+    return sorted(paths)
 
-MIN_CROP_W, MIN_CROP_H = 80, 80  # 너무 작은 크롭은 스킵
-
-
-def build_face_app(ctx_id: int = ARC_CTX_ID) -> FaceAnalysis:
-    """
-    antelopev2 -> buffalo_l 순으로 시도.
-    detection/recognition 모듈만 로드, CPU 실행 기본.
-    """
-    candidates = ["antelopev2", "buffalo_l"]
-    last_err = None
-    for name in candidates:
+# -------------------- ArcFace 로더(탄력) --------------------
+def build_face_app(ctx_id=-1, providers=("CPUExecutionProvider",)):
+    for name in ("antelopev2", "buffalo_l"):
         try:
-            print(f"[INFO] Trying InsightFace model pack: {name}")
+            print(f"[INFO] Loading InsightFace pack: {name}")
             app = FaceAnalysis(
                 name=name,
-                allowed_modules=["detection", "recognition"],
-                providers=["CPUExecutionProvider"]  # GPU 사용 시 "CUDAExecutionProvider" 추가
+                allowed_modules=["detection","recognition"],
+                providers=list(providers)
             )
-            app.prepare(ctx_id=ctx_id, det_size=(640, 640))
-            mkeys = set(getattr(app, "models", {}).keys())
-            if not {"detection", "recognition"}.issubset(mkeys):
-                raise RuntimeError(f"missing modules: {mkeys}")
-            print(f"[INFO] Loaded InsightFace pack: {name} with modules {mkeys}")
+            app.prepare(ctx_id=ctx_id, det_size=(640,640))
+            m = set(getattr(app, "models", {}).keys())
+            if not {"detection","recognition"}.issubset(m):
+                raise RuntimeError(f"missing modules {m}")
             return app
         except Exception as e:
-            print(f"[WARN] load {name} failed: {e}")
-            last_err = e
-    raise RuntimeError(f"All InsightFace packs failed. last error: {last_err}")
-
+            print(f"[WARN] fallback: {name} failed: {e}")
+    raise RuntimeError("All InsightFace packs failed.")
 
 def embed_faces(app: FaceAnalysis, bgr):
-    """faces와 해당 임베딩 리스트(이미 L2 정규화됨)를 반환"""
     faces = app.get(bgr)
-    vecs = [f.normed_embedding for f in faces]
-    return vecs, faces
+    return [f.normed_embedding for f in faces], faces
 
+# -------------------- 갤러리 캐시 --------------------
+def cache_path_for_gallery(ref_dir: Path, who="default"):
+    sig = str(ref_dir.resolve())
+    return CACHE_DIR / f"gallery_{who}_{abs(hash(sig))%10**10}.npy"
 
-def load_gallery_vecs(app: FaceAnalysis, ref_dir: Path):
-    """갤러리의 여러 이미지를 임베딩 벡터 리스트로 로드"""
+def load_gallery(app: FaceAnalysis, ref_dir: Path, who="default"):
+    cp = cache_path_for_gallery(ref_dir, who)
+    if cp.exists():
+        try:
+            arr = np.load(cp)
+            if arr.ndim == 2:  # (N,512)
+                print(f"[INFO] Gallery cache loaded: {cp} ({arr.shape[0]} vecs)")
+                return arr
+        except Exception:
+            pass
+
     vecs = []
-    for p in sorted(ref_dir.glob("*")):
-        if p.suffix.lower() not in (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"):
-            continue
-        im = cv2.imread(str(p))
-        if im is None:
-            print(f"[WARN] ref read fail: {p}")
+    for p in list_images(ref_dir):
+        im = cv2.imread(p)
+        if im is None: 
+            print(f"[WARN] fail to read ref: {p}"); 
             continue
         vlist, _ = embed_faces(app, im)
-        if not vlist:
+        if not vlist: 
             print(f"[WARN] no face in ref: {p}")
         else:
             vecs.extend(vlist)
     if not vecs:
-        raise RuntimeError("No faces found in ref/ gallery. Put clear face images under data/ref/")
-    return vecs
+        raise RuntimeError("No faces in ref/. Put clear faces there.")
 
+    arr = np.stack(vecs, 0).astype(np.float32)
+    np.save(cp, arr)
+    print(f"[INFO] Gallery built & cached: {cp} ({arr.shape[0]} vecs)")
+    return arr
 
-def max_cosine_sim(vec: np.ndarray, gallery_vecs: list[np.ndarray]) -> float:
-    return float(max(np.dot(vec, g) for g in gallery_vecs))
+def max_cosine_sim(vec, gallery_arr: np.ndarray):
+    # gallery_arr: (N,512), vec: (512,)
+    return float(np.max(gallery_arr @ vec))
 
-
-def list_test_images(test_dir: Path):
-    paths = []
-    for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.webp", "*.tif", "*.tiff"):
-        paths += glob.glob(str(test_dir / ext))
-    return sorted(paths)
-
-
-def crop_from_xyxy(img, box_xyxy):
-    x1, y1, x2, y2 = map(int, box_xyxy)
-    x1 = max(0, x1); y1 = max(0, y1)
-    x2 = min(img.shape[1], x2); y2 = min(img.shape[0], y2)
-    if x2 - x1 <= 0 or y2 - y1 <= 0:
-        return None
-    return img[y1:y2, x1:x2]
-
-
-def bbox_contains_point(b, pt):
-    x1, y1, x2, y2 = b
-    x, y = pt
-    return (x1 <= x <= x2) and (y1 <= y <= y2)
-
-
-def main():
-    # 경로/준비
+# -------------------- 파이프라인 --------------------
+def run(
+    imgsz=768, conf_th=0.25, iou_nms=0.60,
+    sim_th=0.33, iou_face_overlap=0.10,
+    min_crop_wh=80, device_yolo="cpu",
+    ctx_id_arc=-1, providers=("CPUExecutionProvider",),
+    multi_targets: dict|None=None   # {"alice": Path, "bob": Path} 형태 지원
+):
     assert WEIGHTS.exists(), f"weights not found: {WEIGHTS}"
-    assert REF_DIR.exists(),  f"ref dir not found: {REF_DIR}"
     assert TEST_DIR.exists(), f"test dir not found: {TEST_DIR}"
+
     SAVE_ROOT.mkdir(parents=True, exist_ok=True)
 
-    # 모델
     yolo = YOLO(str(WEIGHTS))
-    face_app = build_face_app(ctx_id=ARC_CTX_ID)
+    face_app = build_face_app(ctx_id=ctx_id_arc, providers=providers)
 
-    # 갤러리 로드
-    gallery_vecs = load_gallery_vecs(face_app, REF_DIR)
-    print(f"[INFO] Gallery loaded ({len(gallery_vecs)} vectors) from {REF_DIR}  |  SIM_THRESH={SIM_THRESH}")
+    # --- 갤러리 구성 ---
+    target_galleries = {}
+    if multi_targets:  # 여러 사람 화이트리스트
+        for name, ref in multi_targets.items():
+            target_galleries[name] = load_gallery(face_app, Path(ref), who=name)
+    else:              # 단일 타깃 (기본: data/ref)
+        target_galleries["target"] = load_gallery(face_app, REF_DIR, who="target")
 
-    # 테스트 이미지 나열
-    img_paths = list_test_images(TEST_DIR)
+    img_paths = list_images(TEST_DIR)
     print(f"[INFO] test images: {len(img_paths)}")
 
+    summary = []
+    t0 = time.time()
     for ip in img_paths:
         img = cv2.imread(ip)
         if img is None:
             print(f"[WARN] read fail: {ip}")
             continue
 
-        # 1) YOLO 탐지
         res = yolo.predict(
-            source=img, conf=CONF_YOLO, iou=IOU_YOLO, imgsz=IMGSZ_YOLO,
-            device=DEVICE_YOLO, verbose=False
+            source=img, conf=conf_th, iou=iou_nms, imgsz=imgsz,
+            device=device_yolo, verbose=False
         )[0]
 
-        # 2) ArcFace 매칭 (head → person → 전체 이미지 보조)
-        kept_indices = []
+        kept_idxs = []
+        box_sims  = {}  # idx -> (name, best_sim)
 
-        # (a) head 우선 (cls=0)
+        # (a) head 우선
         for i, b in enumerate(res.boxes):
-            if int(b.cls.item()) != 0:
+            if int(b.cls.item()) != 0:  # 0=head
                 continue
-            x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
-            if (x2 - x1) < MIN_CROP_W or (y2 - y1) < MIN_CROP_H:
+            x1,y1,x2,y2 = map(int, b.xyxy[0].tolist())
+            if (x2-x1) < min_crop_wh or (y2-y1) < min_crop_wh:
                 continue
-            crop = crop_from_xyxy(img, (x1, y1, x2, y2))
-            if crop is None:
+            crop = img[y1:y2, x1:x2]
+            vlist, _ = embed_faces(face_app, crop)
+            if not vlist: 
                 continue
-            vlist, faces = embed_faces(face_app, crop)
-            if not vlist:
-                continue
-            sims = [max_cosine_sim(v, gallery_vecs) for v in vlist]
-            if sims and max(sims) >= SIM_THRESH:
-                kept_indices.append(i)
+            best_name, best_sim = None, -1.0
+            for v in vlist:
+                for name, gal in target_galleries.items():
+                    s = max_cosine_sim(v, gal)
+                    if s > best_sim:
+                        best_sim, best_name = s, name
+            if best_sim >= sim_th:
+                kept_idxs.append(i); box_sims[i]=(best_name, best_sim)
 
-        # (b) 보조: person (cls=1)
+        # (b) person 보조
         for i, b in enumerate(res.boxes):
-            if i in kept_indices:
+            if i in kept_idxs or int(b.cls.item()) != 1:  # 1=person
                 continue
-            if int(b.cls.item()) != 1:
+            x1,y1,x2,y2 = map(int, b.xyxy[0].tolist())
+            if (x2-x1) < min_crop_wh or (y2-y1) < min_crop_wh:
                 continue
-            x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
-            if (x2 - x1) < MIN_CROP_W or (y2 - y1) < MIN_CROP_H:
+            crop = img[y1:y2, x1:x2]
+            vlist, _ = embed_faces(face_app, crop)
+            if not vlist: 
                 continue
-            crop = crop_from_xyxy(img, (x1, y1, x2, y2))
-            if crop is None:
-                continue
-            vlist, faces = embed_faces(face_app, crop)
-            if not vlist:
-                continue
-            sims = [max_cosine_sim(v, gallery_vecs) for v in vlist]
-            if sims and max(sims) >= SIM_THRESH:
-                kept_indices.append(i)
+            best_name, best_sim = None, -1.0
+            for v in vlist:
+                for name, gal in target_galleries.items():
+                    s = max_cosine_sim(v, gal)
+                    if s > best_sim:
+                        best_sim, best_name = s, name
+            if best_sim >= sim_th:
+                kept_idxs.append(i); box_sims[i]=(best_name, best_sim)
 
-        # (c) 둘 다 실패하면: 전체 이미지에서 얼굴 찾고, 해당 얼굴 중심을 포함하는 박스 선택
-        if not kept_indices and len(res.boxes) > 0:
+        # (c) 전체 이미지 보조: 모든 얼굴 검사 → IoU로 겹치는 박스 추가
+        if len(res.boxes) > 0:
             vlist, faces = embed_faces(face_app, img)
-            if faces:
-                # 각 얼굴에 대해 유사도 계산
-                for f in faces:
-                    sim = max_cosine_sim(f.normed_embedding, gallery_vecs)
-                    if sim < SIM_THRESH:
-                        continue
+            for f in faces:
+                # 타깃 중 최댓값
+                best_name, best_sim = None, -1.0
+                for name, gal in target_galleries.items():
+                    s = max_cosine_sim(f.normed_embedding, gal)
+                    if s > best_sim:
+                        best_sim, best_name = s, name
+                if best_sim < sim_th: 
+                    continue
+                fx1, fy1, fx2, fy2 = f.bbox.astype(int).tolist()
+                face_box = (fx1, fy1, fx2, fy2)
+                head_cands, person_cands = [], []
+                for i, b in enumerate(res.boxes):
+                    x1,y1,x2,y2 = map(int, b.xyxy[0].tolist())
+                    ov = iou_xyxy(face_box, (x1,y1,x2,y2))
+                    if ov >= iou_face_overlap:
+                        if int(b.cls.item()) == 0: head_cands.append(i)
+                        elif int(b.cls.item()) == 1: person_cands.append(i)
+                for lst in (head_cands, person_cands):
+                    for idx in lst:
+                        if idx not in kept_idxs:
+                            kept_idxs.append(idx); box_sims[idx]=(best_name, best_sim)
 
-                    # 얼굴 중심점 계산
-                    fx1, fy1, fx2, fy2 = f.bbox.astype(int).tolist()
-                    cx = int((fx1 + fx2) / 2); cy = int((fy1 + fy2) / 2)
-
-                    head_candidates, person_candidates = [], []
-                    for i, b in enumerate(res.boxes):
-                        x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
-                        # 중심점 기준 포함(간단) 또는 IoU로 겹침 판단(정밀)
-                        if (x1 <= cx <= x2) and (y1 <= cy <= y2):
-                            if int(b.cls.item()) == 0: head_candidates.append(i)
-                            elif int(b.cls.item()) == 1: person_candidates.append(i)
-
-                    # head 우선, 없으면 person
-                    for cand_list in (head_candidates, person_candidates):
-                        for idx in cand_list:
-                            if idx not in kept_indices:
-                                kept_indices.append(idx)
-
-        # 3) 선택 박스만 유지
-        if kept_indices:
-            kept = [res.boxes.data[i] for i in kept_indices]
-            res.boxes.data = torch.stack(kept, dim=0)
+        # 선택 박스만 유지 + 점수/이름 오버레이
+        if kept_idxs:
+            kept = [res.boxes.data[i] for i in kept_idxs]
+            res.boxes.data = torch.stack(kept, 0)
         else:
             res.boxes = res.boxes[:0]
 
-        # 4) 바로 저장만 (표시 없음)
         vis = res.plot()
+        # label 덧그리기(유사도)
+        for i, b in enumerate(res.boxes):
+            x1,y1,x2,y2 = map(int, b.xyxy[0].tolist())
+            nm, sm = box_sims.get(kept_idxs[i], ("target", 0.0))
+            txt = f"{nm}:{sm:.2f}"
+            cv2.rectangle(vis, (x1,y1), (x2,y2), (0,255,255), 2)
+            cv2.putText(vis, txt, (x1, max(y1-6, 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
+
         out = SAVE_ROOT / f"{Path(ip).stem}_target.jpg"
         cv2.imwrite(str(out), vis)
-        print(f"[SAVED] {out}")
+        summary.append({"image": ip, "kept": len(kept_idxs)} )
+        print(f"[SAVED] {out} (kept={len(kept_idxs)})")
 
-    print("[DONE] all results saved in:", SAVE_ROOT)
+    with open(SAVE_ROOT / "summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    print(f"[DONE] saved -> {SAVE_ROOT} | time: {time.time()-t0:.1f}s")
 
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--imgsz", type=int, default=768)
+    ap.add_argument("--conf", type=float, default=0.25)
+    ap.add_argument("--iou_nms", type=float, default=0.60)
+    ap.add_argument("--sim", type=float, default=0.33)
+    ap.add_argument("--iou_face", type=float, default=0.10)
+    ap.add_argument("--min_crop", type=int, default=80)
+    ap.add_argument("--device", type=str, default="cpu")     # "0" for GPU
+    ap.add_argument("--arc_ctx", type=int, default=-1)       # 0 for GPU(onnxruntime-gpu)
+    ap.add_argument("--multi", type=str, default=None, 
+                    help='JSON: {"alice":"../data/ref_alice","bob":"../data/ref_bob"}')
+    args = ap.parse_args()
+
+    multi = json.loads(args.multi) if args.multi else None
+    run(
+        imgsz=args.imgsz, conf_th=args.conf, iou_nms=args.iou_nms,
+        sim_th=args.sim, iou_face_overlap=args.iou_face, min_crop_wh=args.min_crop,
+        device_yolo=args.device, ctx_id_arc=args.arc_ctx,
+        providers=("CPUExecutionProvider",), multi_targets=multi
+    )
